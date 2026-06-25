@@ -22,8 +22,8 @@ search_query = st.sidebar.text_input("Search for a City:", "Hyderabad, India")
 st.sidebar.markdown("---")
 st.sidebar.header("🎛️ Graph Completion Controls")
 st.sidebar.caption("Adjust distance and orientation tolerances for dead-end healing.")
-healing_threshold = st.sidebar.slider("MAX_DISTANCE (px)", 5.0, 100.0, 20.0, step=5.0)
-max_angle_error = st.sidebar.slider("ANGLE_THRESHOLD (°)", 5.0, 90.0, 30.0, step=5.0)
+healing_threshold = st.sidebar.slider("MAX_DISTANCE (px)", 5.0, 100.0, 41.0, step=1.0)
+max_angle_error = st.sidebar.slider("ANGLE_THRESHOLD (°)", 5.0, 90.0, 45.0, step=5.0)
 
 # --- SESSION STATE ---
 if "bbox" not in st.session_state:
