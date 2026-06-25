@@ -1,0 +1,13 @@
+torch
+torchvision
+segmentation-models-pytorch
+opencv-python-headless
+albumentations
+networkx
+sknw
+scikit-image
+scipy
+matplotlib
+streamlit
+folium
+streamlit-folium

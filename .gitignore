@@ -1,0 +1,17 @@
+# Environments
+venv/
+env/
+.env
+
+# PyCharm / IDE files
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Heavy AI weights & assets
+weights/
+assets/current_target.jpg
+*.geojson
