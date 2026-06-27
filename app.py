@@ -10,22 +10,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 
-st.set_page_config(layout="wide", page_title="AI Traffic Manager - Road Graph Extraction")
+st.set_page_config(layout="wide", page_title="Urban Resilience Analysis")
 
-st.title("🚦 Phase I & II: Extraction & Topological Healing")
-st.markdown("Convert raw satellite imagery into a queryable routing graph.")
+st.title("🚦 ISRO Topological Graph Intelligence Pipeline")
+st.markdown("Transforming satellite occlusion into a mathematically healed, centrality-analyzed routing graph.")
 
-# --- SIDEBAR TUNING CONTROLS ---
 st.sidebar.header("🌍 Map Navigation")
 search_query = st.sidebar.text_input("Search for a City:", "Hyderabad, India")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🎛️ Graph Completion Controls")
-st.sidebar.caption("Adjust distance and orientation tolerances for dead-end healing.")
-healing_threshold = st.sidebar.slider("MAX_DISTANCE (px)", 5.0, 100.0, 41.0, step=1.0)
-max_angle_error = st.sidebar.slider("ANGLE_THRESHOLD (°)", 5.0, 90.0, 45.0, step=5.0)
+st.sidebar.header("🧠 Phase I Controls")
+ai_threshold = st.sidebar.slider("AI Confidence Threshold", 0.1, 0.9, 0.35, step=0.05)
 
-# --- SESSION STATE ---
+st.sidebar.markdown("---")
+st.sidebar.header("🎛️ Phase II Controls")
+healing_threshold = st.sidebar.slider("MAX_DISTANCE (px)", 10.0, 100.0, 50.0, step=5.0)
+max_angle_error = st.sidebar.slider("ANGLE_THRESHOLD (°)", 10.0, 90.0, 60.0, step=5.0)
+
 if "bbox" not in st.session_state:
     st.session_state.bbox = None
 
@@ -35,90 +36,136 @@ def get_coordinates(query):
     geolocator = Nominatim(user_agent="neurax_traffic_app")
     try:
         location = geolocator.geocode(query)
-        if location:
-            return [location.latitude, location.longitude]
+        if location: return [location.latitude, location.longitude]
     except:
         pass
     return [17.3850, 78.4867]
 
 
-center_coords = get_coordinates(search_query)
-
-# --- MAP RENDERING ---
-m = folium.Map(location=center_coords, zoom_start=15,
+# MAP UI
+m = folium.Map(location=get_coordinates(search_query), zoom_start=15,
                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                attr="Esri World Imagery")
 Draw(export=False, position='topleft',
      draw_options={'polyline': False, 'polygon': False, 'circle': False, 'marker': False, 'circlemarker': False,
                    'rectangle': True}).add_to(m)
-
 map_data = st_folium(m, width=1200, height=400)
 
 if map_data and map_data.get("last_active_drawing"):
     geom = map_data["last_active_drawing"]["geometry"]["coordinates"][0]
-    lons = [p[0] for p in geom]
-    lats = [p[1] for p in geom]
-    st.session_state.bbox = f"{min(lons)},{min(lats)},{max(lons)},{max(lats)}"
+    st.session_state.bbox = f"{min(p[0] for p in geom)},{min(p[1] for p in geom)},{max(p[0] for p in geom)},{max(p[1] for p in geom)}"
 
-# --- PIPELINE EXECUTION ---
 if st.session_state.bbox:
-    if st.button("⬇️ Fetch Image & Extract Road Graph", type="primary"):
-        with st.spinner("Downloading high-res tile from ESRI..."):
+    if st.button("⬇️ Run Full ISRO Pipeline", type="primary"):
+        with st.spinner("Downloading and parsing data..."):
             url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox={st.session_state.bbox}&bboxSR=4326&imageSR=4326&size=512,512&format=jpg&f=image"
             response = requests.get(url)
-            if response.status_code == 200:
-                satellite_img = Image.open(BytesIO(response.content))
-                img_array = np.array(satellite_img)
-            else:
-                st.error("Failed to download image.")
-                st.stop()
+            img_array = np.array(Image.open(BytesIO(response.content))) if response.status_code == 200 else st.stop()
 
-        with st.spinner("⚡ Processing AI & Math on RTX 4050..."):
-            from pipeline import load_ai_model, process_and_heal_roads
+        with st.spinner("⚡ Executing Deep Learning & Graph Math..."):
+            from pipeline import load_ai_model, process_and_heal_roads, compute_isro_centrality
 
             model = load_ai_model()
 
-            binary_mask, graph, new_bridges, node_coords = process_and_heal_roads(
-                img_array, model, healing_threshold, max_angle_error
+            # Execute the pipeline
+            pred_mask_soft, binary_mask, skeleton, graph_initial, graph_healed, node_coords = process_and_heal_roads(
+                img_array, model, ai_threshold, 30, healing_threshold, max_angle_error
             )
 
-        st.success("✅ Network Extraction Complete!")
+            # Compute ISRO Metrics
+            lcc_graph = compute_isro_centrality(graph_healed)
 
-        # --- METRICS DISPLAY ---
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Extracted Nodes", len(graph.nodes))
-        m2.metric("Total Routable Edges", len(graph.edges))
-        m3.metric("Connected Sub-graphs", nx.number_connected_components(graph),
-                  help="Lower is better. Represents isolated road networks.")
+        st.success("✅ Graph Analysis Complete!")
 
-        st.markdown("---")
+        # --- THE 5-TAB ARCHITECTURE ---
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "🛰️ 1. Segmentation",
+            "🕸️ 2. Skeleton",
+            "🩹 3. Graph Healing",
+            "🔥 4. Centrality Analysis",
+            "💥 5. Simulation"
+        ])
 
-        # --- VISUALIZATION ---
-        col1, col2 = st.columns(2)
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Raw Satellite Input")
+                st.image(img_array, use_container_width=True)
+            with col2:
+                st.subheader("Soft Probability Map")
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.imshow(pred_mask_soft, cmap='magma')
+                ax.axis('off')
+                st.pyplot(fig)
 
-        with col1:
-            st.subheader("Phase I: AI Binary Mask")
-            bw_mask = (binary_mask * 255).astype(np.uint8)
-            st.image(bw_mask, use_container_width=True)
-
-        with col2:
-            st.subheader("Phase II: Topological NetworkX Graph")
+        with tab2:
+            st.subheader("1D Topological Skeleton")
             fig, ax = plt.subplots(figsize=(10, 10))
-            ax.imshow(np.zeros((512, 512)), cmap='gray')  # Pure black background
-
-            # Draw AI Found Roads (Green)
-            for (s, e) in graph.edges():
-                if 'pts' in graph[s][e]:
-                    pts = graph[s][e]['pts']
-                    ax.plot(pts[:, 1], pts[:, 0], 'g-', linewidth=2, alpha=0.7)
-
-            # Draw Mathematically Healed Bridges (Cyan)
-            for coord_a, coord_b in new_bridges:
-                ax.plot([coord_a[1], coord_b[1]], [coord_a[0], coord_b[0]], 'c-', linewidth=3, label="Healed Edge")
-
-            # Draw Intersections (Red dots)
-            for node, coords in node_coords.items():
-                ax.scatter(coords[1], coords[0], s=30, c='red', zorder=5)
-
+            ax.imshow(skeleton, cmap='gray')
             ax.axis('off')
             st.pyplot(fig)
+
+        with tab3:
+            st.subheader("Component-Aware A* Healing")
+            colA, colB = st.columns(2)
+
+            with colA:
+                st.markdown("**Initial Graph (Broken)**")
+                fig_init, ax_init = plt.subplots(figsize=(8, 8))
+                ax_init.imshow(img_array, alpha=0.5)
+                for (s, e) in graph_initial.edges():
+                    if 'pts' in graph_initial[s][e]:
+                        pts = graph_initial[s][e]['pts']
+                        ax_init.plot(pts[:, 1], pts[:, 0], 'r-', linewidth=2)
+                ax_init.axis('off')
+                st.pyplot(fig_init)
+
+            with colB:
+                st.markdown("**Healed Graph (Connected)**")
+                fig_heal, ax_heal = plt.subplots(figsize=(8, 8))
+                ax_heal.imshow(img_array, alpha=0.5)
+
+                # Draw all edges in the healed graph
+                for (s, e) in graph_healed.edges():
+                    if 'pts' in graph_healed[s][e]:
+                        pts = graph_healed[s][e]['pts']
+                        # Differentiate new vs old visually (if it exists in initial, it's green, else cyan)
+                        color = 'g-' if graph_initial.has_edge(s, e) else 'c--'
+                        width = 2 if color == 'g-' else 3
+                        ax_heal.plot(pts[:, 1], pts[:, 0], color, linewidth=width)
+
+                ax_heal.axis('off')
+                st.pyplot(fig_heal)
+
+        with tab4:
+            st.subheader("Betweenness Centrality (Gatekeeper Nodes)")
+            if lcc_graph:
+                fig_cent, ax_cent = plt.subplots(figsize=(10, 10))
+                ax_cent.imshow(img_array, alpha=0.4)  # Dim background
+
+                # Extract coordinates and centrality scores
+                x, y, c_scores = [], [], []
+                for n, data in lcc_graph.nodes(data=True):
+                    coords = node_coords[n]
+                    x.append(coords[1])
+                    y.append(coords[0])
+                    c_scores.append(data.get('betweenness', 0.0))
+
+                # Scatter plot colored by Betweenness (Red = Critical Bottleneck)
+                sc = ax_cent.scatter(x, y, c=c_scores, cmap='autumn_r', s=100, edgecolors='white', zorder=5)
+
+                # Draw edges softly
+                for (s, e) in lcc_graph.edges():
+                    if 'pts' in lcc_graph[s][e]:
+                        pts = lcc_graph[s][e]['pts']
+                        ax_cent.plot(pts[:, 1], pts[:, 0], 'w-', linewidth=1, alpha=0.5)
+
+                plt.colorbar(sc, ax=ax_cent, label="Betweenness Score")
+                ax_cent.axis('off')
+                st.pyplot(fig_cent)
+            else:
+                st.error("Graph is too fragmented to compute centrality.")
+
+        with tab5:
+            st.subheader("Disaster Simulation & Flow Interruption")
+            st.info("Module active. Ready for Node-Removal mechanics.")

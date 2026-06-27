@@ -3,18 +3,17 @@ import numpy as np
 import segmentation_models_pytorch as smp
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from skimage.morphology import skeletonize, binary_closing, disk, dilation
+from skimage.morphology import skeletonize, binary_closing, disk, dilation, remove_small_objects
+from skimage.graph import route_through_array
 import sknw
 from scipy.spatial import distance, KDTree
 import math
 import networkx as nx
 
-# Automatically route to your RTX 4050
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def load_ai_model(weights_path="weights/best_road_extractor.pth"):
-    """Loads the 40-epoch U-Net++ brain directly into the GPU."""
     print(f"Loading AI Model onto {DEVICE}...")
     model = smp.UnetPlusPlus(encoder_name="resnet34", encoder_weights=None, in_channels=3, classes=1)
     model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
@@ -23,11 +22,8 @@ def load_ai_model(weights_path="weights/best_road_extractor.pth"):
     return model
 
 
-def process_and_heal_roads(image_array, model, healing_threshold=41.0, max_angle_error=45.0):
-    """
-    Phase I: GPU Inference + Morphological Noise Cleaning
-    Phase II: KDTree Vector Healing with Hard Graph Mutation
-    """
+def process_and_heal_roads(image_array, model, ai_threshold=0.35, min_noise_size=30, healing_threshold=50.0,
+                           max_angle_error=60.0):
     # --- PHASE I: AI INFERENCE ---
     transform = A.Compose([
         A.Resize(512, 512),
@@ -38,126 +34,116 @@ def process_and_heal_roads(image_array, model, healing_threshold=41.0, max_angle
 
     with torch.no_grad():
         prediction = model(tensor_img)
-        pred_mask = torch.sigmoid(prediction).squeeze().cpu().numpy()
+        pred_mask_soft = torch.sigmoid(prediction).squeeze().cpu().numpy()
 
-    binary_mask = (pred_mask > 0.5).astype(np.uint8)
-
-    # --- NEW: MORPHOLOGICAL PRE-PROCESSING ---
-    # 1. Dilation: Expands road pixels slightly to jump tiny 1-2 pixel micro-gaps
+    binary_mask = (pred_mask_soft > ai_threshold).astype(np.uint8)
     binary_mask = dilation(binary_mask, disk(1))
-    # 2. Closing: Fills in holes and smoothes jagged edges caused by shadows
-    binary_mask = binary_closing(binary_mask, disk(3))
+    binary_mask = binary_closing(binary_mask, disk(5))
+    binary_mask = remove_small_objects(binary_mask.astype(bool), min_size=min_noise_size).astype(np.uint8)
 
-    # --- PHASE II: TOPOLOGICAL HEALING ---
+    cost_map = np.where(pred_mask_soft > (ai_threshold * 0.5), 1.0 - pred_mask_soft + 0.01, 999.0)
+
+    # --- PHASE II: GRAPH GENERATION ---
     skeleton = skeletonize(binary_mask).astype(np.uint16)
     graph = sknw.build_sknw(skeleton)
 
+    # Deep copy for "Before/After" visualization
+    graph_initial = graph.copy()
+
     dead_ends = [node for node, degree in dict(graph.degree()).items() if degree == 1]
     node_coords = {node: graph.nodes[node]['o'] for node in graph.nodes()}
-    new_bridges = []
+    new_bridges_paths = []
 
-    def get_road_direction(node, graph, coords):
-        neighbor = list(graph.neighbors(node))[0]
-        pts = graph[node][neighbor].get('pts', [])
+    def get_road_direction(node, graph_ref, coords):
+        neighbor = list(graph_ref.neighbors(node))[0]
+        pts = graph_ref[node][neighbor].get('pts', [])
         step = min(5, max(1, len(pts) - 1))
 
         dist_to_start = distance.euclidean(coords[node], pts[0])
         dist_to_end = distance.euclidean(coords[node], pts[-1])
 
-        if dist_to_start < dist_to_end:
-            p1, p2 = pts[0], pts[step]
-        else:
-            p1, p2 = pts[-1], pts[-(step + 1)]
-
-        dy = p1[0] - p2[0]
-        dx = p1[1] - p2[1]
+        p1, p2 = (pts[0], pts[step]) if dist_to_start < dist_to_end else (pts[-1], pts[-(step + 1)])
+        dy, dx = p1[0] - p2[0], p1[1] - p2[1]
         length = math.hypot(dx, dy)
-        if length == 0: return 0, 0
-        return dx / length, dy / length
+        return (dx / length, dy / length) if length > 0 else (0, 0)
 
-    # --- BUILD KDTREES ---
-    if not dead_ends:
-        return binary_mask, graph, new_bridges, node_coords
+    # --- PHASE III: GRAPH HEALING (Topological Mutation) ---
+    if dead_ends:
+        tree_endpoints = KDTree([node_coords[n] for n in dead_ends])
+        connected_this_round = set()
 
-    end_coords_list = [node_coords[n] for n in dead_ends]
-    tree_endpoints = KDTree(end_coords_list)
+        for i, node_a in enumerate(dead_ends):
+            if node_a in connected_this_round: continue
+            coord_a = node_coords[node_a]
+            dir_a = get_road_direction(node_a, graph, node_coords)
 
-    edge_pixels = []
-    for u, v, data in graph.edges(data=True):
-        pts = data.get('pts', [])
-        for i in range(0, len(pts), 5):
-            edge_pixels.append((pts[i][0], pts[i][1]))
+            neighbors = tree_endpoints.query_ball_point(coord_a, healing_threshold)
+            best_path, best_cost, best_target = None, float('inf'), None
 
-    tree_edges = KDTree(edge_pixels) if edge_pixels else None
+            for j in neighbors:
+                node_b = dead_ends[j]
+                if node_a == node_b or node_b in connected_this_round or graph.has_edge(node_a, node_b):
+                    continue
 
-    # --- KDTREE SEARCH & GRAPH MUTATION ---
-    connected_this_round = set()
+                # Check Component Isolation - Only heal across disjointed components!
+                if nx.has_path(graph, node_a, node_b): continue
 
-    for i, node_a in enumerate(dead_ends):
-        if node_a in connected_this_round: continue
+                coord_b = node_coords[node_b]
+                dir_b = get_road_direction(node_b, graph, node_coords)
 
-        coord_a = node_coords[node_a]
-        dir_a = get_road_direction(node_a, graph, node_coords)
+                bridge_dx, bridge_dy = coord_b[1] - coord_a[1], coord_b[0] - coord_a[0]
+                euclidean_len = math.hypot(bridge_dx, bridge_dy)
 
-        # STRATEGY A: Dead-End to Dead-End
-        neighbors = tree_endpoints.query_ball_point(coord_a, healing_threshold)
-        snapped = False
-
-        for j in neighbors:
-            node_b = dead_ends[j]
-            if node_a == node_b or node_b in connected_this_round: continue
-            if graph.has_edge(node_a, node_b): continue
-
-            coord_b = node_coords[node_b]
-            dir_b = get_road_direction(node_b, graph, node_coords)
-
-            bridge_dx, bridge_dy = coord_b[1] - coord_a[1], coord_b[0] - coord_a[0]
-            bridge_len = math.hypot(bridge_dx, bridge_dy)
-
-            if bridge_len > 0:
-                vec_ab = (bridge_dx / bridge_len, bridge_dy / bridge_len)
-                vec_ba = (-bridge_dx / bridge_len, -bridge_dy / bridge_len)
-
-                dot_a = (dir_a[0] * vec_ab[0]) + (dir_a[1] * vec_ab[1])
-                dot_b = (dir_b[0] * vec_ba[0]) + (dir_b[1] * vec_ba[1])
-
-                angle_a = math.degrees(math.acos(max(-1.0, min(1.0, dot_a))))
-                angle_b = math.degrees(math.acos(max(-1.0, min(1.0, dot_b))))
-
-                if angle_a < max_angle_error and angle_b < max_angle_error:
-                    graph.add_edge(node_a, node_b, weight=bridge_len)
-                    new_bridges.append((coord_a, coord_b))
-                    connected_this_round.add(node_a)
-                    connected_this_round.add(node_b)
-                    snapped = True
-                    break
-
-        # STRATEGY B: Mid-Road Snapping (HARD GRAPH MUTATION)
-        if not snapped and tree_edges is not None:
-            dist, idx = tree_edges.query(coord_a, distance_upper_bound=healing_threshold)
-
-            if dist != float('inf'):
-                target_pixel = edge_pixels[idx]
-
-                bridge_dx = target_pixel[1] - coord_a[1]
-                bridge_dy = target_pixel[0] - coord_a[0]
-                bridge_len = math.hypot(bridge_dx, bridge_dy)
-
-                if bridge_len > 0:
-                    vec_ab = (bridge_dx / bridge_len, bridge_dy / bridge_len)
+                if euclidean_len > 0:
+                    vec_ab = (bridge_dx / euclidean_len, bridge_dy / euclidean_len)
+                    vec_ba = (-bridge_dx / euclidean_len, -bridge_dy / euclidean_len)
                     dot_a = (dir_a[0] * vec_ab[0]) + (dir_a[1] * vec_ab[1])
+                    dot_b = (dir_b[0] * vec_ba[0]) + (dir_b[1] * vec_ba[1])
+
                     angle_a = math.degrees(math.acos(max(-1.0, min(1.0, dot_a))))
+                    angle_b = math.degrees(math.acos(max(-1.0, min(1.0, dot_b))))
 
-                    if angle_a < max_angle_error:
-                        # ⚠️ The Graph Mutation: Inject a new routable node mid-road!
-                        new_node_id = max(graph.nodes()) + 1
-                        graph.add_node(new_node_id, o=np.array(target_pixel))
-                        graph.add_edge(node_a, new_node_id, weight=bridge_len)
+                    if angle_a < max_angle_error and angle_b < max_angle_error:
+                        start_idx = (int(coord_a[0]), int(coord_a[1]))
+                        end_idx = (int(coord_b[0]), int(coord_b[1]))
 
-                        # Add to node_coords so UI can draw it
-                        node_coords[new_node_id] = np.array(target_pixel)
+                        try:
+                            indices, cost = route_through_array(cost_map, start_idx, end_idx, fully_connected=True)
+                            if cost < 600.0 and cost < best_cost:
+                                best_cost = cost
+                                best_path = indices
+                                best_target = node_b
+                        except ValueError:
+                            pass
 
-                        new_bridges.append((coord_a, target_pixel))
-                        connected_this_round.add(node_a)
+            if best_path:
+                # Add the logical edge directly to NetworkX
+                graph.add_edge(node_a, best_target, weight=len(best_path), pts=np.array(best_path))
+                new_bridges_paths.append(best_path)
+                connected_this_round.add(node_a)
+                connected_this_round.add(best_target)
 
-    return binary_mask, graph, new_bridges, node_coords
+    return pred_mask_soft, binary_mask, skeleton, graph_initial, graph, node_coords
+
+
+def compute_isro_centrality(graph):
+    """Calculates Betweenness and k-Core on the Largest Connected Component."""
+    if len(graph.nodes) == 0: return None
+
+    # Isolate the largest connected component for valid routing flow
+    largest_cc = max(nx.connected_components(graph), key=len)
+    lcc = graph.subgraph(largest_cc).copy()
+
+    # 1. Betweenness Centrality (Critical Chokepoints)
+    # Note: We use inverse weight because sknw edge weights are usually length (lower is faster)
+    betweenness = nx.betweenness_centrality(lcc, weight='weight')
+
+    # 2. k-Core (Network Resilience / Core dense areas)
+    # Remove self-loops first as k-core doesn't support them
+    lcc.remove_edges_from(nx.selfloop_edges(lcc))
+    k_core = nx.core_number(lcc)
+
+    nx.set_node_attributes(lcc, betweenness, 'betweenness')
+    nx.set_node_attributes(lcc, k_core, 'k_core')
+
+    return lcc
